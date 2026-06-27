@@ -405,3 +405,140 @@ How `planning.md` sections feed the AI code-generation steps in Milestones 3–5
   matching the three variants above.
 - **Audit-log sample (≥3 entries)** — captured in the README / `GET /log` output
   once the pipeline runs.
+
+---
+
+# Stretch feature — Ensemble detection (voting)
+
+This section is the plan for the first stretch feature. I'm writing it before I
+touch any code, same as the required milestones.
+
+## What I'm adding and why
+
+Right now the system uses two signals (the Groq LLM and the stylometry heuristics)
+and blends their scores with a weighted average. For the ensemble stretch feature
+I'm adding a third signal and changing how the signals are combined: instead of
+averaging numbers, each signal will cast a vote, and the final verdict comes from
+counting the votes.
+
+I picked voting because it's the clearest way to show "ensemble" thinking — three
+independent opinions that have to agree before the system commits to a confident
+answer. It also fits the thing I care about most in this project: I'd rather the
+system say "we're not sure" than wrongly accuse a real writer. With voting, if the
+three signals don't agree, that disagreement naturally becomes an "uncertain"
+result instead of a confident guess.
+
+## The third signal — repetition / redundancy (pure Python)
+
+The two signals I already have look at different things: the LLM reads the meaning
+and overall feel of the text, and the stylometry looks at structure like sentence
+length variation. For the third signal I want something genuinely different from
+both, otherwise it's not really a third opinion.
+
+So the third signal measures **repetition**: how much the text repeats itself.
+AI writing often leans on the same phrases and the same transition words over and
+over ("Furthermore", "It is important to note", "Additionally"), and reuses the
+same sentence openings. Human writing tends to repeat less mechanically. I'll
+measure this in plain Python by looking at things like repeated word pairs and
+triples, and how varied the sentence beginnings are. A more repetitive text gets a
+higher AI-likeness score.
+
+I chose a pure-Python heuristic instead of a second LLM call on purpose. A second
+LLM call would cost another API request every time and, more importantly, it would
+probably agree with the first LLM most of the time (same model, same blind spots) —
+so it wouldn't really be an independent third vote. The repetition heuristic is
+free to run and looks at something neither of the other two signals checks directly.
+
+**What it measures:** how much the text repeats words, phrases, and sentence
+openings.
+
+**Why it differs between human and AI:** AI text tends to reuse phrasing and
+transitions more mechanically; human writing varies more.
+
+**Its blind spot:** some legitimate human writing is deliberately repetitive —
+poetry with refrains, song-style lyrics, rhetorical repetition for effect. Those
+could look "AI-like" to this signal. That's exactly why it's only one vote out of
+three and can be outvoted by the other two.
+
+## How the voting works
+
+Each of the three signals turns its score into one of three votes:
+
+- **AI** — this signal thinks the text is AI-generated
+- **human** — this signal thinks the text is human-written
+- **abstain** — this signal doesn't trust its own answer here, so it sits this one out
+
+The "abstain" option is important and is where my existing safety rules now live
+naturally. For example, the stylometry signal isn't reliable on very short text, so
+on short submissions it abstains instead of voting — that's the old "short-text
+guard" built right into the voting model. A signal can also abstain when its score
+is right in the middle (it genuinely can't tell).
+
+Then I count the votes, and the rules are **deliberately asymmetric** because a
+false accusation is worse than a missed one:
+
+- To return **likely_ai**, I want real agreement — at least two signals voting AI
+  and *no* signal voting human. One lonely AI vote is not enough to accuse someone.
+- To return **likely_human**, the bar is lower — a simple majority of human votes
+  is enough, because clearing someone is the safer direction to be wrong in.
+- Anything else — a split, lots of abstentions, or AI votes that are contradicted
+  by a human vote — comes back as **uncertain**.
+
+This means my old "if the signals disagree, say uncertain" rule isn't a special
+case bolted on anymore; it's just what happens when the votes are split.
+
+## Keeping the confidence number meaningful
+
+I don't want to lose the calibrated confidence I worked hard on in Milestone 4
+(where 0.62 means "uncertain" and 0.77 means "confidently AI"). Pure vote-counting
+would make confidence blunt — basically just "3 out of 3" or "2 out of 3."
+
+So I'm keeping a confidence number alongside the votes, and I'll base it on **how
+decisive the vote was**:
+
+- All three signals agree → high confidence
+- Two agree, one abstains → medium-high confidence
+- A close or split vote → low confidence (which is what "uncertain" should feel like)
+
+That way the votes decide the verdict, but the confidence still reflects how strong
+the agreement was — so the three transparency labels keep showing a meaningful
+percentage, not just a tally.
+
+## Showing the votes to the user
+
+To make the ensemble visible (and honest), I'll include each signal's individual
+vote in the API response and in the audit log, something like:
+
+```
+votes: { llm: "ai", stylometry: "human", repetition: "ai" }  ->  verdict: uncertain
+```
+
+This shows the "three opinions deliberating" rather than hiding it behind one
+number, and it makes the audit log more useful for a human reviewer reading an appeal.
+
+## What changes and what doesn't
+
+**Changes:** I add one new signal file for the repetition heuristic, and I rewrite
+the scoring logic so it votes and tallies instead of averaging. The scoring rewrite
+is the bulk of the work.
+
+**Stays the same:** the `/submit`, `/appeal`, and `/log` endpoints, the three
+transparency labels, the audit log format (just gains the votes), rate limiting,
+and the existing LLM and stylometry signals. I'm only touching the scoring core and
+adding one signal.
+
+## Re-calibration (the real work)
+
+Adding a third voter changes every result, so the main job isn't writing the code —
+it's re-testing. After it's built I'll re-run my calibration set (`test_pipeline.py`,
+extended to print the votes) and check three things:
+
+1. Clearly-human text still comes back **likely_human**.
+2. Clearly-AI text where signals agree still reaches **likely_ai**.
+3. The formal / academic human sample — my main false-positive worry — still lands
+   in **uncertain** and is never confidently accused.
+
+If the third signal pushes any human-written sample toward a confident AI verdict,
+I'll tighten the voting rule (for example, require the AI vote to be unanimous) or
+make the repetition signal abstain more readily. The asymmetry — protecting real
+writers from false accusations — has to survive the change, or the feature isn't worth shipping.
