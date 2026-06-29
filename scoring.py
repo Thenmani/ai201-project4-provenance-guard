@@ -1,88 +1,112 @@
 """
-Confidence fusion + verdict banding.  [planning.md > Fusion + Uncertainty Representation]
+Ensemble voting + verdict.  [planning.md > Stretch: Ensemble detection (voting)]
 
-Combines the two signal scores (each on the axis 0 = human-like, 1 = AI-like)
-into a single calibrated `ai_likelihood`, then maps it to a verdict using
-DELIBERATELY ASYMMETRIC bands (it is harder to assert "AI" than "human").
+Combines THREE signal scores (each on the axis 0 = human-like, 1 = AI-like) by
+having each signal cast a vote, then tallying the votes with DELIBERATELY
+ASYMMETRIC rules (it is harder to reach "AI" than "human").
 
-Rules implemented (all from planning.md):
-  1. Weighted fusion:  ai_likelihood = 0.65*llm + 0.35*stylo   (LLM weighted higher; stylometry is noisier)
-  2. Short-text guard: < 40 words -> stylometry is unreliable. Shift weight to the
-     LLM (0.90/0.10) and WIDEN the uncertain band, so the system is slower to make
-     a confident claim on short text.
-  3. Disagreement->uncertain: if |llm - stylo| > 0.40 the signals contradict each
-     other; clamp the result into the uncertain band rather than trusting either.
+How a signal votes (per-signal threshold on its 0-1 score):
+    score >= VOTE_AI_AT     -> votes "ai"
+    score <= VOTE_HUMAN_AT  -> votes "human"
+    otherwise               -> "abstain"  (the signal can't tell)
 
-Bands (normal):      ai>=0.80 likely_ai | 0.40<ai<0.80 uncertain | ai<=0.40 likely_human
-Bands (short text):  ai>=0.85 likely_ai | 0.35<ai<0.85 uncertain | ai<=0.35 likely_human
+Abstaining also absorbs the old short-text guard: stylometry and the repetition
+signal are unreliable on very short text, so on < 40 words they abstain instead of
+voting. (The LLM signal still votes — it does not depend on length the same way.)
+
+Tally rules (asymmetric, because a false accusation is worse than a missed one):
+    likely_ai     : at least 2 "ai" votes AND zero "human" votes
+    likely_human  : "human" votes are the strict majority of cast (non-abstain) votes
+    uncertain     : anything else (a split, too many abstentions, or AI votes that
+                    are contradicted by a human vote)
+
+Confidence reflects how DECISIVE the vote was, so the graded confidence from
+Milestone 4 survives (we don't collapse to a blunt tally):
+    unanimous (3 agree)        -> ~0.90
+    2 agree + 1 abstain        -> ~0.78
+    2 agree + 1 dissent        -> ~0.60  (-> usually lands uncertain anyway)
+    mostly abstain / split     -> low
 """
 
-# Fusion weights
-W_LLM, W_STYLO = 0.65, 0.35
-W_LLM_SHORT, W_STYLO_SHORT = 0.90, 0.10
+# Per-signal vote thresholds.
+VOTE_AI_AT = 0.60      # score >= this -> the signal votes "ai"
+VOTE_HUMAN_AT = 0.40   # score <= this -> the signal votes "human"
 
-# Verdict band cutoffs
-AI_CUT, HUMAN_CUT = 0.75, 0.40              # normal
-AI_CUT_SHORT, HUMAN_CUT_SHORT = 0.82, 0.35  # short text (wider uncertain band)
-
-SHORT_TEXT_WORDS = 40
-DISAGREEMENT_THRESHOLD = 0.40
+SHORT_TEXT_WORDS = 40  # below this, structural signals (stylometry, repetition) abstain
 
 
-def _clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+def _vote(score):
+    if score >= VOTE_AI_AT:
+        return "ai"
+    if score <= VOTE_HUMAN_AT:
+        return "human"
+    return "abstain"
 
 
-def fuse_signals(llm_score, stylo_score, n_words):
-    """Combine the two signals into a calibrated verdict.
+def _confidence_from_votes(verdict, votes):
+    """Confidence = how decisive the vote was (see module docstring)."""
+    cast = [v for v in votes.values() if v != "abstain"]
+    n_ai = list(votes.values()).count("ai")
+    n_human = list(votes.values()).count("human")
 
-    Returns a dict:
+    if verdict == "likely_ai":
+        # decisiveness scales with how many agreed and whether anyone abstained
+        if n_ai == 3:
+            return 0.90
+        if n_ai == 2:
+            return 0.78
+        return 0.70
+    if verdict == "likely_human":
+        if n_human == 3:
+            return 0.90
+        if n_human == 2:
+            return 0.78
+        return 0.70
+    # uncertain: low confidence, lower the more the voters were split / silent
+    if not cast:
+        return 0.50
+    agreement = abs(n_ai - n_human) / max(len(cast), 1)
+    return round(0.45 + 0.10 * agreement, 4)  # ~0.45-0.55 band
+
+
+def vote_signals(llm_score, stylo_score, repetition_score, n_words):
+    """Ensemble-vote the three signals into a verdict.
+
+    Returns:
       {
-        "ai_likelihood": float,     # 0..1, the system's P(AI)
-        "verdict": str,             # likely_ai | uncertain | likely_human
-        "confidence": float,        # confidence IN the verdict (see planning.md)
-        "rules_applied": [str],     # which rules fired (for the audit log)
-        "weights": {"llm":..,"stylo":..}
+        "verdict": str,                 # likely_ai | uncertain | likely_human
+        "confidence": float,            # confidence IN the verdict (decisiveness)
+        "votes": {"llm":.., "stylometry":.., "repetition":..},
+        "tally": {"ai":n, "human":n, "abstain":n},
       }
     """
-    rules = []
     short = n_words < SHORT_TEXT_WORDS
 
-    # --- Rule 2: short-text guard picks the weights & cutoffs ---
-    if short:
-        w_llm, w_stylo = W_LLM_SHORT, W_STYLO_SHORT
-        ai_cut, human_cut = AI_CUT_SHORT, HUMAN_CUT_SHORT
-        rules.append("short_text_guard")
-    else:
-        w_llm, w_stylo = W_LLM, W_STYLO
-        ai_cut, human_cut = AI_CUT, HUMAN_CUT
+    votes = {
+        "llm": _vote(llm_score),
+        # structural signals abstain on short text (old short-text guard)
+        "stylometry": "abstain" if short else _vote(stylo_score),
+        "repetition": "abstain" if short else _vote(repetition_score),
+    }
 
-    # --- Rule 1: weighted fusion ---
-    ai_likelihood = w_llm * llm_score + w_stylo * stylo_score
+    n_ai = list(votes.values()).count("ai")
+    n_human = list(votes.values()).count("human")
+    cast = n_ai + n_human
 
-    # --- Rule 3: disagreement -> clamp into the uncertain band ---
-    if abs(llm_score - stylo_score) > DISAGREEMENT_THRESHOLD:
-        ai_likelihood = _clamp(ai_likelihood, human_cut + 0.01, ai_cut - 0.01)
-        rules.append("disagreement_to_uncertain")
-
-    ai_likelihood = round(_clamp(ai_likelihood, 0.0, 1.0), 4)
-
-    # --- verdict from asymmetric bands ---
-    if ai_likelihood >= ai_cut:
+    # --- asymmetric tally ---
+    if n_ai >= 2 and n_human == 0:
         verdict = "likely_ai"
-        confidence = ai_likelihood
-    elif ai_likelihood <= human_cut:
+    elif n_human > n_ai and n_human > (cast - n_human):
+        # human votes are the strict majority of cast votes
         verdict = "likely_human"
-        confidence = 1.0 - ai_likelihood
     else:
         verdict = "uncertain"
-        # Confidence in an "uncertain" verdict = how central it is (peaks at 0.5).
-        confidence = 1.0 - 2 * abs(ai_likelihood - 0.5)
+
+    confidence = _confidence_from_votes(verdict, votes)
 
     return {
-        "ai_likelihood": ai_likelihood,
         "verdict": verdict,
-        "confidence": round(_clamp(confidence, 0.0, 1.0), 4),
-        "rules_applied": rules,
-        "weights": {"llm": w_llm, "stylo": w_stylo},
+        "confidence": round(confidence, 4),
+        "votes": votes,
+        "tally": {"ai": n_ai, "human": n_human, "abstain": list(votes.values()).count("abstain")},
     }

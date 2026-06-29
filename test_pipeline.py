@@ -1,27 +1,23 @@
 """
-Milestone 4 calibration test - the four deliberately chosen inputs.
+Ensemble calibration test - the deliberately chosen inputs, with VOTES shown.
 
     python test_pipeline.py
 
-Runs the FULL pipeline (LLM signal + stylometry + fusion) on a clearly-AI sample,
-a clearly-human sample, and two borderline cases. Prints both signal scores
-separately alongside the fused result, so if a verdict looks wrong you can see
-which signal is responsible (per the milestone's debugging hint).
+Runs the full three-signal ensemble (LLM + stylometry + repetition) and prints
+each signal's score, each signal's vote, the tally, the verdict, and confidence -
+so you can see the deliberation, not just the final label.
 
-Expected shape of results:
-  - clearly AI    -> high ai_likelihood, likely_ai
-  - clearly human -> low ai_likelihood, likely_human
-  - formal human  -> stylometry leans AI (the trap); fusion/asymmetry should keep
-                     it OUT of a confident AI accusation (uncertain or human)
-  - edited AI     -> mid-range / uncertain
-  - clearly AI (signals agree) -> high ai_likelihood, likely_ai (demonstrates the
-                     AI band is reachable when BOTH signals agree)
+Re-calibration checks (from planning.md > Stretch: Ensemble):
+  1. clearly-human text  -> likely_human
+  2. clearly-AI (signals agree) -> likely_ai
+  3. formal / academic human (the false-positive trap) -> uncertain, never accused
 """
 
 from dotenv import load_dotenv
 from llm_signal import get_llm_signal
 from stylometry import get_stylometric_signal
-from scoring import fuse_signals
+from repetition import get_repetition_signal
+from scoring import vote_signals
 
 load_dotenv()
 
@@ -38,13 +34,12 @@ if __name__ == "__main__":
         n_words = len(text.split())
         s1 = get_llm_signal(text)
         s2 = get_stylometric_signal(text)
-        fused = fuse_signals(s1["llm_score"], s2["stylo_score"], n_words)
+        s3 = get_repetition_signal(text)
+        r = vote_signals(s1["llm_score"], s2["stylo_score"], s3["repetition_score"], n_words)
+        v = r["votes"]
 
-        print(f"\n{'='*70}\n{label}  ({n_words} words)")
-        print(f"  llm_score   = {s1['llm_score']:.2f}   ({s1['rationale']})")
-        print(f"  stylo_score = {s2['stylo_score']:.2f}   "
-              f"(CV={s2['features']['sentence_length_cv']:.2f})")
-        print(f"  --> ai_likelihood = {fused['ai_likelihood']:.2f}  "
-              f"VERDICT = {fused['verdict']}  (confidence {fused['confidence']:.2f})")
-        if fused["rules_applied"]:
-            print(f"      rules fired: {', '.join(fused['rules_applied'])}")
+        print(f"\n{'='*72}\n{label}  ({n_words} words)")
+        print(f"  scores : llm={s1['llm_score']:.2f}  stylo={s2['stylo_score']:.2f}  repetition={s3['repetition_score']:.2f}")
+        print(f"  votes  : llm={v['llm']}  stylometry={v['stylometry']}  repetition={v['repetition']}")
+        print(f"  tally  : {r['tally']}")
+        print(f"  --> VERDICT = {r['verdict']}  (confidence {r['confidence']:.2f})")

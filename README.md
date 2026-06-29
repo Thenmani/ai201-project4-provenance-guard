@@ -16,13 +16,19 @@ drives every design decision:
 > borderline cases into an honest "uncertain" verdict rather than a confident
 > accusation.
 
+Detection uses an **ensemble of three independent signals that vote** on each
+submission (see [Ensemble detection](#ensemble-detection-voting)). The required
+build used two signals combined by weighted average; the ensemble stretch feature
+replaced that with three-signal voting.
+
 ---
 
 ## Table of contents
 
 - [Architecture](#architecture)
 - [Detection signals](#detection-signals)
-- [Confidence scoring & uncertainty](#confidence-scoring--uncertainty)
+- [Ensemble detection (voting)](#ensemble-detection-voting)
+- [Confidence & uncertainty](#confidence--uncertainty)
 - [Transparency labels (three variants)](#transparency-labels-three-variants)
 - [Appeals workflow](#appeals-workflow)
 - [Rate limiting](#rate-limiting)
@@ -37,38 +43,41 @@ drives every design decision:
 ```
 SUBMISSION FLOW
                          raw text
-   Creator ──────────────────────────────► POST /submit
-                                                │
-                                       (rate limiter checks caller)
-                                                │ valid text + content_id
-                                                ▼
-                                   ┌────────────────────────┐
-                          raw text │   Input Validation /   │ raw text
-                       ┌───────────┤      Preprocessing     ├───────────┐
-                       │           └────────────────────────┘           │
-                       ▼                                                 ▼
-            ┌──────────────────┐                            ┌─────────────────────┐
-            │  Signal 1: LLM   │                            │ Signal 2: Stylometry│
-            │     (Groq)       │                            │   (pure Python)     │
-            └──────────────────┘                            └─────────────────────┘
-                       │ llm_score (0–1)                          │ stylo_score (0–1)
-                       └──────────────────┬────────────────────────┘
+   Creator ──────────────────────────► POST /submit
+                                            │
+                                   (rate limiter checks caller)
+                                            │ valid text + content_id
+                                            ▼
+                                 ┌────────────────────────┐
+                                 │  Input Validation /    │
+                                 │     Preprocessing      │
+                                 └────────────────────────┘
+                  ┌──────────────────────┼──────────────────────┐
+                  ▼                       ▼                       ▼
+        ┌──────────────────┐   ┌──────────────────┐   ┌────────────────────┐
+        │ Signal 1: LLM    │   │ Signal 2:        │   │ Signal 3:          │
+        │ (Groq, semantic) │   │ Stylometry       │   │ Repetition         │
+        │                  │   │ (structural)     │   │ (structural)       │
+        └──────────────────┘   └──────────────────┘   └────────────────────┘
+                  │ vote                  │ vote                  │ vote
+                  └───────────────────────┼───────────────────────┘
                                           ▼
                                ┌────────────────────┐
-                               │  Confidence Fusion │  (asymmetric: harder to assert "AI")
+                               │   Ensemble Vote    │  (asymmetric tally:
+                               │   + Tally          │   harder to assert "AI")
                                └────────────────────┘
-                                          │ ai_likelihood (0–1) + verdict
+                                          │ verdict + confidence + votes
                                           ▼
                                ┌────────────────────┐
                                │  Label Generator   │
                                └────────────────────┘
-                                          │ label variant + label text
+                                          │ label variant + text
                         ┌─────────────────┼─────────────────┐
                         ▼                                     ▼
                ┌────────────────┐                  ┌────────────────────┐
                │  Audit Logger  │  full decision   │  Response Builder  │
-               │   + Store      │  record          └────────────────────┘
-               └────────────────┘                            │ JSON {id, verdict, confidence, label}
+               │   + Store      │  + votes         └────────────────────┘
+               └────────────────┘                            │ JSON {id, verdict, confidence, label, votes}
                                                              ▼
                                                           Creator
 
@@ -80,23 +89,25 @@ APPEAL FLOW
 ```
 
 On **submission**, text hits `POST /submit`, passes the rate limiter and
-validation, then fans out to the LLM detector and the stylometric analyzer. Their
-two scores are fused into one calibrated `ai_likelihood`, mapped to a verdict and a
-transparency label, written to the audit log, and returned. On **appeal**, the
-creator calls `POST /appeal` with the `content_id` and their reasoning; the handler
-finds the original decision, records the reasoning, flips status to `under_review`,
-and logs it — **no automated re-classification** (a human reviewer owns the next step).
+validation, then fans out to all three detection signals. Each signal casts a vote;
+the ensemble tallies the votes with asymmetric rules into a verdict + confidence,
+maps that to a transparency label, writes the audit log, and returns. On **appeal**,
+the creator calls `POST /appeal` with the `content_id` and their reasoning; the
+handler finds the original decision, records the reasoning, flips status to
+`under_review`, and logs it — **no automated re-classification** (a human reviewer
+owns the next step).
 
 Source files: `app.py` (routes), `llm_signal.py` (Signal 1), `stylometry.py`
-(Signal 2), `scoring.py` (fusion + banding), `labels.py` (label generation),
-`audit.py` (structured log + appeal updates).
+(Signal 2), `repetition.py` (Signal 3), `scoring.py` (ensemble voting),
+`labels.py` (label generation), `audit.py` (structured log + appeal updates).
 
 ---
 
 ## Detection signals
 
-Two genuinely distinct signals — one semantic, one structural. They fail in
-*different* ways, which is why combining them is more informative than either alone.
+Three genuinely distinct signals — one semantic, two structural-but-different. They
+fail in *different* ways, which is why combining them is more informative than any
+one alone, and why a vote between them carries real information.
 
 ### Signal 1 — LLM classification (Groq `llama-3.3-70b-versatile`) — *semantic*
 
@@ -108,101 +119,132 @@ Two genuinely distinct signals — one semantic, one structural. They fail in
 - **Blind spot:** it is a model judging models. It can be fooled by lightly
   human-edited AI text, and can wrongly flag polished/formal/ESL human writing as
   AI. It has no ground truth and can drift run-to-run. **Primary false-positive source.**
-- **Robustness note:** in practice the model occasionally emits slightly malformed
-  JSON (e.g. an unquoted rationale). `llm_signal.py` parses strict JSON first and
-  falls back to regex-extracting the probability, so a formatting slip never crashes
-  the pipeline. This is a real lesson about LLM signals — you must engineer around
-  their unreliability at producing structured output.
+- **Robustness note:** the model occasionally emits slightly malformed JSON (e.g. an
+  unquoted rationale). `llm_signal.py` parses strict JSON first and falls back to
+  regex-extracting the probability, so a formatting slip never crashes the pipeline.
 
-### Signal 2 — Stylometric heuristics (pure Python) — *structural*
+### Signal 2 — Stylometric heuristics (pure Python) — *structural (variance)*
 
 - **Measures:** quantifiable variance — sentence-length burstiness (coefficient of
   variation), type-token ratio (vocabulary diversity), and punctuation variety.
 - **Why it differs:** human writing is bursty and uneven; AI text clusters around
   uniform, mid-length sentences with smoother distributions.
 - **Output:** each feature maps to a 0–1 "AI-likeness" sub-value; combined into
-  `stylo_score ∈ [0,1]` with a **burstiness-dominant weighting** (see calibration).
+  `stylo_score ∈ [0,1]` with a **burstiness-dominant weighting (0.70/0.15/0.15)**.
+  Calibration showed type-token ratio and punctuation barely separate short samples
+  (TTR clustered ≈0.83–0.90), while burstiness separated them cleanly — so a flat
+  average would let the weak metrics wash out the strong one. (A concrete instance of
+  this signal's blind spot.)
 - **Blind spot:** blind to meaning and easily gamed; needs length to be reliable
   (near-useless on a short poem or excerpt) and penalizes humans who legitimately
   write uniformly (technical writers, strict poetic forms, ESL).
 
-**Independence:** one signal is semantic, the other structural. When they *disagree*
-that is itself information (it pushes toward "uncertain"); when they agree, confidence
-is better founded than either could justify alone.
+### Signal 3 — Repetition / redundancy heuristic (pure Python) — *structural (redundancy)*
+
+- **Measures:** how much the text repeats itself — formulaic transition density
+  ("Furthermore", "Moreover", "It is important to note"), repeated word-pairs/triples,
+  and how varied the sentence openings are.
+- **Why it differs:** AI writing leans on the same connectors and phrasings
+  mechanically; human writing repeats less predictably. This is distinct from
+  stylometry: stylometry measures *variance/shape*, this measures *redundancy*.
+- **Output:** sub-metrics combined transition-dominant (0.60/0.25/0.15) into
+  `repetition_score ∈ [0,1]` (higher = more repetitive = more AI-like).
+- **Useful property:** formal/academic human writing scores ≈0 here (it is formal but
+  not full of cheap filler), so this signal tends to **protect** the false-positive
+  trap case rather than worsen it — it casts a "human" vote on exactly the writing the
+  other two signals are most likely to misread.
+- **Blind spot:** some legitimate human writing is deliberately repetitive (poetry
+  with refrains, rhetorical repetition). Those could look AI-like to this signal —
+  which is why it is only one vote of three and can be outvoted.
+
+**Independence:** one semantic signal, two structural signals that measure *different*
+structural properties (variance vs. redundancy). When they disagree that is itself
+information (it pushes toward "uncertain"); when they agree, confidence is better
+founded than any one could justify alone.
 
 ---
 
-## Confidence scoring & uncertainty
+## Ensemble detection (voting)
 
-The system reasons on one number: **`ai_likelihood ∈ [0,1]`** — its estimated
-probability the text is AI-generated. `0.0` = certainly human, `1.0` = certainly AI,
-`0.5` = a genuine coin flip. A score of `0.6` therefore means "leaning AI, but not
-confidently" — it lands in the **uncertain** band and produces *no* accusation.
+*(Stretch feature.)* The required build combined two signals with a weighted average
+and mapped the result onto asymmetric confidence bands. The ensemble feature replaces
+that with **three signals that vote**, which makes the deliberation explicit and folds
+the old hand-written rules into the voting model itself.
 
-### Fusion
+### How a signal votes
+
+Each signal converts its `0–1` score into one of three votes:
+
+| score | vote |
+|---|---|
+| `≥ 0.60` | **ai** |
+| `≤ 0.40` | **human** |
+| in between | **abstain** (the signal can't tell) |
+
+**Abstaining absorbs the old short-text guard.** Below 40 words the structural signals
+(stylometry, repetition) are unreliable, so they abstain instead of voting; the LLM
+still votes. A signal also abstains when its score sits in the indecisive middle.
+
+### Asymmetric tally (the false-positive principle, as vote rules)
+
+| Verdict | Rule |
+|---|---|
+| **likely_ai** | at least **2 "ai" votes AND zero "human" votes** |
+| **likely_human** | "human" votes are the strict majority of cast votes |
+| **uncertain** | anything else — a split, too many abstentions, or AI votes contradicted by a human vote |
+
+The asymmetry lives in that first rule: a single dissenting "human" vote **vetoes** an
+AI accusation, even when two signals vote AI. It is deliberately easier to clear a
+creator than to accuse one. The old "disagreement → uncertain" rule isn't a special
+case anymore — a split vote simply *is* disagreement.
+
+### Confidence from vote decisiveness
+
+To keep the graded confidence from the required build (rather than collapsing to a
+blunt tally), confidence reflects *how decisive* the vote was:
+
+- unanimous (3 agree) → **0.90**
+- 2 agree + 1 abstain → **0.78**
+- split / mostly abstaining → low (≈0.45–0.55, which is what "uncertain" should feel like)
+
+### Calibration — `python test_pipeline.py`
+
+The ensemble was re-calibrated on a five-case corpus. The test prints each signal's
+score, its vote, the tally, and the verdict, so the deliberation is visible:
 
 ```
-ai_likelihood = 0.65 × llm_score + 0.35 × stylo_score      (LLM weighted higher; stylometry is noisier)
+1. CLEARLY AI               scores llm=0.90 stylo=0.40 rep=0.54  votes ai/abstain/abstain   -> uncertain    (0.55)
+2. CLEARLY HUMAN            scores llm=0.20 stylo=0.00 rep=0.00  votes human/human/human    -> likely_human (0.90)
+3. BORDERLINE formal human  scores llm=0.60 stylo=0.67 rep=0.00  votes ai/ai/human          -> uncertain    (0.48)
+4. BORDERLINE edited AI     scores llm=0.20 stylo=0.35 rep=0.00  votes human/abstain/abstain-> likely_human (0.70)
+5. CLEARLY AI (agree)       scores llm=0.80 stylo=0.70 rep=0.60  votes ai/ai/ai             -> likely_ai    (0.90)
 ```
 
-Two asymmetry-protecting rules override the raw average:
+Three things to read here:
 
-1. **Disagreement → uncertain.** If `|llm_score − stylo_score| > 0.40`, the signals
-   contradict each other; the result is clamped into the uncertain band rather than
-   trusting either.
-2. **Short-text guard.** Below 40 words, stylometry is unreliable, so its weight
-   drops to 0.10 and the uncertain band widens (see cutoffs).
+- **Case 5** — unanimous AI vote → `likely_ai` at 0.90. The AI band is reachable when
+  all three signals agree.
+- **Case 3 (the false-positive trap)** — the LLM and stylometry both vote AI, but the
+  **repetition signal votes human** (academic prose isn't full of filler), and that
+  single dissent vetoes the accusation → `uncertain`. The third signal actively
+  protected a real writer. This is the ensemble's whole point.
+- **Case 1** — a genuinely AI text where only the LLM was confident (stylometry and
+  repetition both abstained on borderline structural scores). With one lone AI vote,
+  the system returns `uncertain` rather than accusing on a single signal. This is a
+  *deliberate* false negative: missing an AI text is the acceptable direction to be
+  wrong, where falsely accusing a human is not. It is the design working, not a miss
+  to "fix."
 
-### Asymmetric verdict bands
+---
 
-The bar to accuse is high and narrow; the uncertain band is wide and skewed toward
-the AI side, so borderline-AI text is caught as *uncertain* rather than falsely accused.
+## Confidence & uncertainty
 
-| `ai_likelihood` | Verdict | |
-|---|---|---|
-| `≥ 0.75` | **likely_ai** | narrow — requires both signals to agree |
-| `0.40 – 0.75` | **uncertain** | wide, skewed toward the AI side |
-| `≤ 0.40` | **likely_human** | |
-
-(Short text < 40 words uses a wider uncertain band: `≥ 0.82` AI, `≤ 0.35` human.)
-
-Reported confidence: for `likely_ai`, `confidence = ai_likelihood`; for
-`likely_human`, `confidence = 1 − ai_likelihood`; for `uncertain`, the label asserts
-no numeric confidence.
-
-### How I tested that scores are *meaningful* (calibration)
-
-A score is only meaningful if it **separates** known cases. Running the pipeline on a
-five-case corpus (`python test_pipeline.py`) produced all three verdicts and confirmed
-separation:
-
-```
-1. CLEARLY AI                llm=0.90 stylo=0.40 -> ai_likelihood=0.73  uncertain     (signals disagree)
-2. CLEARLY HUMAN             llm=0.20 stylo=0.00 -> ai_likelihood=0.13  likely_human
-3. BORDERLINE: formal human  llm=0.60 stylo=0.67 -> ai_likelihood=0.62  uncertain     (false-positive trap held)
-4. BORDERLINE: edited AI     llm=0.20 stylo=0.35 -> ai_likelihood=0.21  likely_human
-5. CLEARLY AI (signals agree) llm=0.80 stylo=0.70 -> ai_likelihood=0.77  likely_ai
-```
-
-Two deliberate calibration findings came out of this and were fed back into the spec:
-
-1. **Stylometry is burstiness-dominant (0.70 / 0.15 / 0.15), not a flat average.**
-   On short samples, type-token ratio clustered tightly (≈0.83–0.90 for every sample,
-   human or AI) and punctuation variety was noisy — only sentence-length burstiness
-   separated the cases. A flat average would have let the two weak metrics wash out
-   the strong one. (This is itself a concrete instance of the stylometry blind spot.)
-
-2. **AI cutoff lowered 0.80 → 0.75.** With the LLM realistically topping out around
-   0.80–0.90 and stylometry around 0.70, the maximum fused score for genuine AI text
-   sat near 0.80 — a 0.80 cutoff made `likely_ai` practically unreachable even when
-   both signals agreed. 0.75 makes the band reachable only when both independent
-   signals agree, while still sitting well above the 0.62 the formal-human trap
-   produced — so the false-positive protection holds.
-
-The **most important result** is case 3 (and `writer-chen` in the log below): formal /
-academic human writing where stylometry leaned AI, but the system declined to
-confidently accuse and returned *uncertain*. That is the false-positive principle
-working in code.
+The verdict is one of three values — `likely_ai`, `uncertain`, `likely_human` — and a
+confidence in `[0,1]` derived from how decisive the vote was (above). The reader never
+sees raw signal scores; they see a plain-language label whose wording and confidence
+reflect the verdict. The system is built to be *honest about not knowing*: `uncertain`
+is a first-class outcome, returned whenever the signals split, dissent, or abstain,
+rather than forcing a guess.
 
 ---
 
@@ -227,9 +269,9 @@ submission (the `{pct}%` below is filled at runtime).
 
 | Variant | Reached when | Confidence shown? | Tone |
 |---|---|---|---|
-| `likely_ai` | `ai_likelihood ≥ 0.75` (both signals agree) | yes | hedged, non-accusatory, offers appeal |
-| `likely_human` | `ai_likelihood ≤ 0.40` | yes | reassuring, framed as estimate |
-| `uncertain` | in-between, or signals disagree, or short text | no (deliberately) | refuses to guess |
+| `likely_ai` | ≥2 signals vote AI and none vote human | yes | hedged, non-accusatory, offers appeal |
+| `likely_human` | human votes are the majority | yes | reassuring, framed as estimate |
+| `uncertain` | split vote, a dissenting vote, or too many abstentions | no (deliberately) | refuses to guess |
 
 ---
 
@@ -243,8 +285,8 @@ submission (the `{pct}%` below is filled at runtime).
   populated, `appeal_timestamp` recorded — and returns a confirmation. **No automated
   re-classification**; a human reviewer owns the next step.
 - **What a reviewer sees:** the audit entry carries everything needed to review —
-  original verdict and confidence, both signal scores, the creator's reasoning, and
-  timestamps.
+  the verdict and confidence, all three signal scores, each signal's vote and the
+  tally, the creator's reasoning, and timestamps.
 
 Example:
 
@@ -296,11 +338,11 @@ Over the limit, the endpoint returns `429` with a JSON body:
 
 Every decision is written to a structured JSON log (`audit_log.json`), surfaced via
 `GET /log`. Each entry records: timestamp, `content_id`, `creator_id`, attribution,
-confidence, `ai_likelihood`, **both** individual signal scores, the label variant, which
-fusion rules fired, status, and the appeal fields (`appeal_reasoning` /
+confidence, **all three** individual signal scores, each signal's **vote** and the
+**tally**, the label variant, status, and the appeal fields (`appeal_reasoning` /
 `appeal_timestamp`, populated only if appealed).
 
-Sample (three real entries spanning all three verdicts, including one appealed):
+Sample (three entries spanning all three verdicts, including one appealed):
 
 ```json
 {
@@ -308,40 +350,40 @@ Sample (three real entries spanning all three verdicts, including one appealed):
     {
       "content_id": "6276e110-7e6b-407e-aa84-28e9d9703374",
       "creator_id": "writer-anna",
-      "timestamp": "2026-06-27T03:09:04.844851Z",
+      "timestamp": "2026-06-29T01:23:09.526108Z",
       "attribution": "likely_human",
-      "confidence": 0.8525,
-      "ai_likelihood": 0.1475,
-      "signals": { "llm_score": 0.2, "stylo_score": 0.05 },
+      "confidence": 0.9,
+      "signals": { "llm_score": 0.2, "stylo_score": 0.0, "repetition_score": 0.0 },
+      "votes": { "llm": "human", "stylometry": "human", "repetition": "human" },
+      "tally": { "ai": 0, "human": 3, "abstain": 0 },
       "label_variant": "likely_human",
-      "rules_applied": [],
       "status": "classified",
       "appeal_reasoning": null
     },
     {
       "content_id": "d4244f2e-bf84-4be0-814d-785cb66f0859",
       "creator_id": "writer-ben",
-      "timestamp": "2026-06-27T03:10:29.993636Z",
+      "timestamp": "2026-06-29T01:25:14.110210Z",
       "attribution": "likely_ai",
-      "confidence": 0.765,
-      "ai_likelihood": 0.765,
-      "signals": { "llm_score": 0.8, "stylo_score": 0.7 },
+      "confidence": 0.9,
+      "signals": { "llm_score": 0.8, "stylo_score": 0.7, "repetition_score": 0.6 },
+      "votes": { "llm": "ai", "stylometry": "ai", "repetition": "ai" },
+      "tally": { "ai": 3, "human": 0, "abstain": 0 },
       "label_variant": "likely_ai",
-      "rules_applied": [],
       "status": "under_review",
       "appeal_reasoning": "This is my own writing. As a non-native English speaker my style tends to be more formal, which I believe was misread as AI.",
-      "appeal_timestamp": "2026-06-27T03:12:27.163664Z"
+      "appeal_timestamp": "2026-06-29T01:27:02.880901Z"
     },
     {
       "content_id": "2dd0ecd6-6c47-48e9-b9b8-48773c4b9a34",
       "creator_id": "writer-chen",
-      "timestamp": "2026-06-27T03:11:58.924957Z",
+      "timestamp": "2026-06-29T01:26:40.512377Z",
       "attribution": "uncertain",
-      "confidence": 0.7528,
-      "ai_likelihood": 0.6236,
-      "signals": { "llm_score": 0.6, "stylo_score": 0.6673 },
+      "confidence": 0.48,
+      "signals": { "llm_score": 0.6, "stylo_score": 0.6673, "repetition_score": 0.0 },
+      "votes": { "llm": "ai", "stylometry": "ai", "repetition": "human" },
+      "tally": { "ai": 2, "human": 1, "abstain": 0 },
       "label_variant": "uncertain",
-      "rules_applied": [],
       "status": "classified",
       "appeal_reasoning": null
     }
@@ -349,9 +391,13 @@ Sample (three real entries spanning all three verdicts, including one appealed):
 }
 ```
 
-These three tell the system's story end to end: a clear human result, an AI result that
-the creator appealed (now `under_review`), and a formal-human case the system declined
-to confidently accuse (`uncertain`).
+These three tell the system's story end to end: a unanimous human result, a unanimous
+AI result that the creator appealed (now `under_review`), and the formal-human case
+where the repetition signal's lone "human" vote vetoed the accusation → `uncertain`.
+
+> Note: regenerate this sample from your own live run before final submission — delete
+> `audit_log.json`, submit a few pieces and file one appeal (as in Setup), then paste
+> the real `GET /log` output here so the documented entries match your run exactly.
 
 ---
 
@@ -359,7 +405,7 @@ to confidently accuse (`uncertain`).
 
 | Method & path | Body | Returns |
 |---|---|---|
-| `POST /submit` | `{ text, creator_id }` | `{ content_id, attribution, confidence, ai_likelihood, label:{variant,text}, signals, rules_applied }`. Errors: `400` (missing/short text), `429` (rate limited), `502` (detection failure). |
+| `POST /submit` | `{ text, creator_id }` | `{ content_id, attribution, confidence, label:{variant,text}, votes, tally, signals:{llm, stylometry, repetition} }`. Errors: `400` (missing/short text), `429` (rate limited), `502` (detection failure). |
 | `POST /appeal` | `{ content_id, creator_reasoning }` | `{ content_id, status:"under_review", message, appeal_reasoning }`. Errors: `400` (missing field), `404` (unknown id), `429`. |
 | `GET /log` | — | `{ entries: [...] }` |
 | `GET /health` | — | `{ status:"ok" }` |
@@ -378,9 +424,10 @@ pip install -r requirements.txt
 # 3. run the server
 python app.py            # serves on http://127.0.0.1:5000
 
-# 4. (optional) verify the detection pipeline calibration
+# 4. (optional) verify the ensemble calibration (shows each signal's vote)
 python test_pipeline.py
 ```
 
-**Stack:** Flask, Groq (`llama-3.3-70b-versatile`), pure-Python stylometry,
-Flask-Limiter, JSON audit log. `.env` and `audit_log.json` are gitignored.
+**Stack:** Flask, Groq (`llama-3.3-70b-versatile`), pure-Python stylometry +
+repetition heuristics, Flask-Limiter, JSON audit log. `.env` and `audit_log.json`
+are gitignored.

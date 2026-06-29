@@ -23,7 +23,8 @@ from dotenv import load_dotenv
 
 from llm_signal import get_llm_signal
 from stylometry import get_stylometric_signal
-from scoring import fuse_signals
+from repetition import get_repetition_signal
+from scoring import vote_signals
 from labels import generate_label
 from audit import write_entry, update_entry, get_log, utc_now_iso
 
@@ -93,11 +94,16 @@ def submit():
     s2 = get_stylometric_signal(text)
     stylo_score = s2["stylo_score"]
 
-    # --- Fusion: combine into calibrated confidence + verdict ---
-    fused = fuse_signals(llm_score, stylo_score, n_words)
-    attribution = fused["verdict"]
-    confidence = fused["confidence"]
-    ai_likelihood = fused["ai_likelihood"]
+    # --- Signal 3: Repetition / redundancy (pure Python, structural) ---
+    s3 = get_repetition_signal(text)
+    repetition_score = s3["repetition_score"]
+
+    # --- Ensemble: three signals vote, asymmetric tally -> verdict ---
+    result = vote_signals(llm_score, stylo_score, repetition_score, n_words)
+    attribution = result["verdict"]
+    confidence = result["confidence"]
+    votes = result["votes"]
+    tally = result["tally"]
 
     # --- Transparency label (real, 3-variant) ---
     label = generate_label(attribution, confidence)
@@ -109,13 +115,14 @@ def submit():
         "timestamp": utc_now_iso(),
         "attribution": attribution,
         "confidence": confidence,
-        "ai_likelihood": ai_likelihood,
         "signals": {
             "llm_score": llm_score,
             "stylo_score": stylo_score,
+            "repetition_score": repetition_score,
         },
+        "votes": votes,
+        "tally": tally,
         "label_variant": label["variant"],
-        "rules_applied": fused["rules_applied"],
         "status": "classified",
         "appeal_reasoning": None,   # populated if/when an appeal is filed
     }
@@ -126,13 +133,14 @@ def submit():
         "content_id": content_id,
         "attribution": attribution,
         "confidence": confidence,
-        "ai_likelihood": ai_likelihood,
         "label": label,
+        "votes": votes,
+        "tally": tally,
         "signals": {
             "llm": {"llm_score": llm_score, "rationale": s1["rationale"]},
             "stylometry": {"stylo_score": stylo_score, "features": s2["features"]},
+            "repetition": {"repetition_score": repetition_score, "features": s3["features"]},
         },
-        "rules_applied": fused["rules_applied"],
     })
 
 
